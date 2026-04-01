@@ -1,0 +1,92 @@
+# ============================================
+# Training Configuration
+# ============================================
+
+# Phase 1: SER Domain Adaptation (Warm-Up)
+phase1:
+  enabled: true
+  datasets:
+    - "iemocap"
+    - "gemep"
+    - "jl_corpus"
+  task: "emotion_classification"
+  num_classes: 5                           # anger, fear, sadness, neutral, happy
+  epochs: 15
+  lr:
+    lora_adapters: 1.0e-4
+    egemaps_mlp: 1.0e-3
+    head: 1.0e-3
+  optimizer: "adamw"
+  weight_decay: 0.01
+  batch_size: 16
+
+# Phase 2: Anxiety Fine-Tuning (Main Training)
+phase2:
+  datasets:
+    - "daic_woz"
+    - "depac"
+    - "verbio"
+  task: "anxiety_classification"
+  num_classes: 1                           # Binary (sigmoid)
+  epochs: 35
+  lr:
+    lora_adapters: 5.0e-5
+    egemaps_mlp: 5.0e-5
+    fusion_head: 1.0e-4
+  warmup_steps: 300
+  scheduler: "cosine_annealing"
+  optimizer: "adamw"
+  weight_decay: 0.01
+  batch_size: 16
+  gradient_accumulation_steps: 4
+  gradient_clip_norm: 1.0
+  early_stopping:
+    patience: 7
+    metric: "auc_roc"
+    mode: "max"
+
+# General
+general:
+  seed: 42
+  sample_rate: 16000
+  segment_length_seconds: 10
+  segment_hop_seconds: 5
+  min_audio_seconds: 3
+  decision_threshold: 0.5
+  primary_metric: "auc_roc"
+  fp16: false                              # Set true if GPU supports it
+  num_workers: 4
+
+# Data split
+split:
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  speaker_independent: true                # REQUIRED: no speaker leakage
+
+# DAIC-WOZ specific
+daic_woz:
+  data_dir: "../dataset"                   # Relative to project root
+  labels_file: "labels.csv"               # PHQ-8 / GAD scores per participant
+  anxiety_threshold: 10                    # GAD-7 >= 10 → anxious
+  use_participant_only: true               # Filter out Ellie's speech
+
+# Augmentation
+augmentation:
+  enabled: true
+  time_stretch:
+    min_rate: 0.85
+    max_rate: 1.15
+    p: 0.5
+  pitch_shift:
+    min_semitones: -2
+    max_semitones: 2
+    p: 0.5
+  gaussian_noise:
+    min_amplitude: 0.001
+    max_amplitude: 0.015
+    p: 0.5
+  gain:
+    min_gain_db: -6
+    max_gain_db: 6
+    p: 0.3

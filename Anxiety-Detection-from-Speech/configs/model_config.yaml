@@ -1,0 +1,49 @@
+# ============================================
+# Model Architecture Configuration
+# ============================================
+
+# Wav2Vec 2.0 backbone
+wav2vec:
+  model_name: "facebook/wav2vec2-base"    # or "facebook/wav2vec2-large-960h" for final
+  hidden_size: 768                         # 768 for base, 1024 for large
+  num_transformer_layers: 12               # 12 for base, 24 for large
+  freeze_conv_encoder: true
+  freeze_transformer: true                 # LoRA handles adaptation
+
+# LoRA configuration
+lora:
+  r: 8                                     # Rank
+  alpha: 16                                # Scaling factor (alpha/r = 2)
+  target_modules:
+    - "q_proj"
+    - "v_proj"
+  dropout: 0.05
+  bias: "none"
+
+# Weighted Layer Aggregation
+layer_aggregation:
+  num_layers: 12                           # Must match wav2vec.num_transformer_layers
+  init: "uniform"                          # Initialize all weights equally
+
+# Attention Pooling
+attention_pooling:
+  hidden_dim: 768                          # Must match wav2vec.hidden_size
+
+# eGeMAPS Branch
+egemaps:
+  input_dim: 88                            # eGeMAPSv02 Functionals feature count
+  proj_dim: 128
+  dropout: 0.2
+
+# Feature Fusion
+fusion:
+  deep_dim: 768                            # From attention pooling
+  acoustic_dim: 128                        # From eGeMAPS projection
+  output_dim: 256
+  dropout: 0.3
+
+# Classification Head
+classifier:
+  hidden_dim: 64
+  dropout: 0.3
+  num_classes: 1                           # Binary classification (sigmoid)

@@ -1,0 +1,659 @@
+"""
+Standalone Speech Anxiety Detection Training Script for Kaggle.
+Single-file implementation of the Dual-Branch Fusion Architecture:
+    Wav2Vec 2.0 + LoRA  +  eGeMAPS (openSMILE)
+
+=== KAGGLE USAGE ===
+Cell 1 — Install dependencies:
+    !pip install -q transformers peft opensmile audiomentations librosa soundfile
+
+Cell 2 — Set your dataset path and labels, then run this script:
+    !python kaggle_train_standalone.py
+
+OR paste this entire file into a single code cell and run.
+
+=== DATASET FORMAT SUPPORTED ===
+Supports BOTH layout styles automatically:
+
+Layout 1 – Flat (your current Kaggle dataset):
+    /kaggle/input/anxiety-dataset/
+        486_AUDIO.wav
+        486_TRANSCRIPT.csv
+        ...
+
+Layout 2 – Nested (DAIC-WOZ standard):
+    /kaggle/input/daic-woz-dataset/
+        486_P/
+            486_AUDIO.wav
+            486_TRANSCRIPT.csv
+            ...
+
+=== OUTPUT ===
+Checkpoint saved to: /kaggle/working/checkpoints/best_phase2.pt  (~2 MB)
+Download this to your local machine and use it with predict.py.
+"""
+
+# ─────────────────────────────────────────────
+# STEP 0: IMPORTS
+# ─────────────────────────────────────────────
+import os
+import warnings
+import itertools
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import librosa
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from sklearn.metrics import roc_auc_score
+from transformers import Wav2Vec2Model
+from peft import LoraConfig, get_peft_model
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+# ─────────────────────────────────────────────
+# STEP 1: CONFIGURATION  ← Edit this section
+# ─────────────────────────────────────────────
+class Config:
+    # ── DATA ───────────────────────────────────────────────────────────────
+    # Path to your Kaggle input dataset. The script auto-detects flat OR nested layout.
+    DATA_DIR = "/kaggle/input/anxiety-dataset"
+
+    # Labels: map participant_id (int) → label (0=non-anxious, 1=anxious)
+    # DAIC-WOZ uses PHQ-8 score >= 10 as the depression/anxiety threshold.
+    # Add all your participants below. Any participant NOT listed defaults to label=0.
+    LABELS = {
+        486: 0,   # example — replace with real labels once you have them
+        # 300: 1,
+        # 305: 0,
+        # ...
+    }
+
+    # ── OUTPUT ─────────────────────────────────────────────────────────────
+    CHECKPOINT_DIR = "/kaggle/working/checkpoints"
+
+    # ── AUDIO ──────────────────────────────────────────────────────────────
+    SR            = 16000     # Sample rate (Wav2Vec needs 16kHz)
+    SEGMENT_SEC   = 10.0      # Length of each audio segment in seconds
+    HOP_SEC       = 5.0       # Hop between segments (50% overlap → more training samples)
+    MIN_SEC       = 3.0       # Minimum segment length; shorter ones are zero-padded
+    PARTICIPANT_ONLY = True   # If True, strips out Ellie (interviewer) turns using TRANSCRIPT.csv
+
+    # ── MODEL ──────────────────────────────────────────────────────────────
+    WAV2VEC_MODEL = "facebook/wav2vec2-base"
+    LORA_R        = 8
+    LORA_ALPHA    = 16
+    EGEMAPS_DIM   = 88       # eGeMAPSv02 Functionals dimension
+    FUSION_DIM    = 256
+
+    # ── TRAINING ───────────────────────────────────────────────────────────
+    EPOCHS          = 35
+    BATCH_SIZE      = 8       # Use 8 for GPU memory safety; increase if CUDA OOM
+    GRAD_ACCUM      = 4       # Effective batch = BATCH_SIZE * GRAD_ACCUM = 32
+    LR_LORA         = 5e-5
+    LR_HEAD         = 1e-4
+    PATIENCE        = 7
+    VAL_SPLIT       = 0.2     # Fraction of segments used for validation
+    DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
+    SEED            = 42
+
+os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
+torch.manual_seed(Config.SEED)
+np.random.seed(Config.SEED)
+
+
+# ─────────────────────────────────────────────
+# STEP 2: AUDIO UTILITIES
+# ─────────────────────────────────────────────
+def load_audio(path: str, sr: int = Config.SR) -> np.ndarray:
+    wav, _ = librosa.load(path, sr=sr, mono=True)
+    return wav.astype(np.float32)
+
+def normalize(wav: np.ndarray) -> np.ndarray:
+    peak = np.max(np.abs(wav))
+    return (wav / peak).astype(np.float32) if peak > 1e-6 else wav
+
+def zero_pad(wav: np.ndarray, min_samples: int) -> np.ndarray:
+    if len(wav) >= min_samples:
+        return wav
+    return np.concatenate([wav, np.zeros(min_samples - len(wav), dtype=np.float32)])
+
+def get_participant_speech(wav: np.ndarray, transcript_path: Optional[str], sr: int) -> np.ndarray:
+    """
+    Use the TRANSCRIPT.csv to strip out Ellie's turns and keep only
+    participant speech. This removes interviewer influence from features.
+    Falls back to full audio if transcript is missing or unreadable.
+    """
+    if not transcript_path or not Path(transcript_path).exists():
+        return wav
+    try:
+        df = pd.read_csv(transcript_path, sep="\t")
+        rows = df[df["speaker"] == "Participant"]
+        chunks = []
+        for _, row in rows.iterrows():
+            s = int(float(row["start_time"]) * sr)
+            e = min(int(float(row["stop_time"]) * sr), len(wav))
+            if e > s:
+                chunks.append(wav[s:e])
+        if chunks:
+            return np.concatenate(chunks).astype(np.float32)
+    except Exception:
+        pass
+    return wav
+
+def make_segments(wav: np.ndarray, sr: int, seg_sec: float, hop_sec: float, min_sec: float) -> List[np.ndarray]:
+    """
+    Slice a long audio file into overlapping fixed-length windows.
+    For a 10-minute recording with seg=10s and hop=5s, this creates ~120 segments —
+    turning 1 participant into 120 training samples.
+    """
+    seg_samples = int(seg_sec * sr)
+    hop_samples = int(hop_sec * sr)
+    min_samples = int(min_sec * sr)
+
+    # If audio is shorter than one window, pad and return as-is
+    if len(wav) <= seg_samples:
+        return [zero_pad(wav, min_samples)]
+
+    segments = []
+    start = 0
+    while start < len(wav):
+        end = start + seg_samples
+        chunk = wav[start:end]
+        if len(chunk) >= min_samples:
+            segments.append(zero_pad(chunk, seg_samples))
+        start += hop_samples
+
+    return segments if segments else [zero_pad(wav[:seg_samples], seg_samples)]
+
+
+def extract_egemaps(wav: np.ndarray, sr: int) -> np.ndarray:
+    """Extract eGeMAPSv02 88-d feature vector. Returns zeros on failure."""
+    try:
+        import opensmile
+        smile = opensmile.Smile(
+            feature_set=opensmile.FeatureSet.eGeMAPSv02,
+            feature_level=opensmile.FeatureLevel.Functionals,
+        )
+        df = smile.process_signal(wav, sr)
+        return df.values.flatten().astype(np.float32)
+    except Exception:
+        return np.zeros(Config.EGEMAPS_DIM, dtype=np.float32)
+
+
+# ─────────────────────────────────────────────
+# STEP 3: DATASET — Auto-finds flat OR nested layout
+# ─────────────────────────────────────────────
+def discover_participants(data_dir: str) -> List[Dict]:
+    """
+    Scan the dataset directory and discover all participants.
+    Handles both flat (files directly in root) and nested (files in sub-folders) layouts.
+
+    Returns a list of dicts:
+        {"participant_id": int, "audio_path": str, "transcript_path": str | None}
+    """
+    root = Path(data_dir)
+    participants = []
+
+    if not root.exists():
+        print(f"ERROR: Dataset directory not found: {root}")
+        print("       Check Config.DATA_DIR and ensure the Kaggle dataset is added.")
+        return participants
+
+    # ── Auto-detect layout ──────────────────────────────────────────────
+    # Look for *_AUDIO.wav in root (flat) OR in sub-dirs (nested)
+    audio_files = list(root.glob("*_AUDIO.wav"))         # flat
+    if not audio_files:
+        audio_files = list(root.glob("*/*_AUDIO.wav"))   # nested (DAIC-WOZ standard)
+
+    if not audio_files:
+        print(f"ERROR: No *_AUDIO.wav files found under {root}")
+        print("       Make sure your dataset contains files named like '486_AUDIO.wav'")
+        return participants
+
+    print(f"Found {len(audio_files)} participant audio file(s).")
+
+    for audio_path in sorted(audio_files):
+        # Extract participant ID from filename, e.g. "486_AUDIO.wav" → 486
+        try:
+            pid = int(audio_path.stem.replace("_AUDIO", ""))
+        except ValueError:
+            print(f"  Skipping {audio_path.name} — could not parse participant ID.")
+            continue
+
+        # Look for matching transcript in same directory as the audio
+        transcript = audio_path.parent / f"{pid}_TRANSCRIPT.csv"
+        participants.append({
+            "participant_id": pid,
+            "audio_path": str(audio_path),
+            "transcript_path": str(transcript) if transcript.exists() else None,
+        })
+        print(f"  Participant {pid}: audio={'OK'} | transcript={'OK' if transcript.exists() else 'MISSING'}")
+
+    return participants
+
+
+class SegmentDataset(Dataset):
+    """
+    Segment-level Dataset.
+
+    Converts each participant into multiple 10s overlapping audio segments.
+    All segments from one participant carry the same label.
+    eGeMAPS features are extracted per-segment (patient), or zero if opensmile fails.
+    """
+    def __init__(self, segments: List[Dict], augmentor=None):
+        """
+        Args:
+            segments: List of {"waveform": np.array, "egemaps": np.array, "label": float}
+            augmentor: Optional AudioAugmentor
+        """
+        self.segments = segments
+        self.augmentor = augmentor
+
+    def __len__(self):
+        return len(self.segments)
+
+    def __getitem__(self, idx: int) -> Dict:
+        entry = self.segments[idx]
+        wav = entry["waveform"].copy()
+
+        if self.augmentor is not None:
+            wav = self.augmentor(wav, Config.SR)
+
+        return {
+            "waveform": torch.from_numpy(wav).float(),
+            "egemaps": torch.from_numpy(entry["egemaps"]).float(),
+            "label": torch.tensor(entry["label"], dtype=torch.float32),
+            "speaker_id": entry["speaker_id"],
+        }
+
+
+class AudioAugmentor:
+    def __init__(self):
+        try:
+            from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Gain
+            self.aug = Compose([
+                AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
+                TimeStretch(min_rate=0.85, max_rate=1.15, p=0.5),
+                PitchShift(min_semitones=-2, max_semitones=2, p=0.5),
+                Gain(min_gain_db=-6, max_gain_db=6, p=0.3),
+            ])
+            self.ok = True
+        except ImportError:
+            self.ok = False
+            print("audiomentations not installed — augmentation disabled.")
+
+    def __call__(self, wav: np.ndarray, sr: int) -> np.ndarray:
+        if not self.ok:
+            return wav
+        return self.aug(samples=wav.astype(np.float32), sample_rate=sr).astype(np.float32)
+
+
+def build_segments(participants: List[Dict], labels: Dict[int, int]) -> List[Dict]:
+    """
+    Pre-process all participants: load audio, extract participant speech,
+    create overlapping segments, and extract eGeMAPS per-segment.
+    Returns a flat list of segment dicts ready for the Dataset.
+    """
+    all_segments = []
+
+    for p in participants:
+        pid = p["participant_id"]
+        label = float(labels.get(pid, 0))
+        print(f"\n  Processing participant {pid} (label={int(label)})...")
+
+        # Load
+        wav = load_audio(p["audio_path"])
+
+        # Filter to participant speech only (removes Ellie's turns)
+        if Config.PARTICIPANT_ONLY:
+            wav = get_participant_speech(wav, p["transcript_path"], Config.SR)
+
+        # Normalize
+        wav = normalize(wav)
+        duration = len(wav) / Config.SR
+        print(f"    Audio duration (participant speech only): {duration:.1f}s")
+
+        # Segment
+        segs = make_segments(wav, Config.SR, Config.SEGMENT_SEC, Config.HOP_SEC, Config.MIN_SEC)
+        print(f"    Created {len(segs)} segment(s) of {Config.SEGMENT_SEC}s")
+
+        # Extract eGeMAPS per segment
+        for i, seg_wav in enumerate(segs):
+            eg = extract_egemaps(seg_wav, Config.SR)
+            all_segments.append({
+                "waveform": seg_wav,
+                "egemaps": eg,
+                "label": label,
+                "speaker_id": str(pid),
+            })
+
+    print(f"\nTotal segments across all participants: {len(all_segments)}")
+    return all_segments
+
+
+def collate_fn(batch: List[Dict]) -> Dict:
+    """Dynamic padding collation."""
+    waveforms = [b["waveform"] for b in batch]
+    max_len = max(w.shape[0] for w in waveforms)
+
+    padded, masks = [], []
+    for w in waveforms:
+        l = w.shape[0]
+        padded.append(torch.cat([w, torch.zeros(max_len - l)]))
+        mask = torch.zeros(max_len, dtype=torch.long)
+        mask[:l] = 1
+        masks.append(mask)
+
+    return {
+        "waveforms":      torch.stack(padded),
+        "attention_mask": torch.stack(masks),
+        "egemaps":        torch.stack([b["egemaps"] for b in batch]),
+        "labels":         torch.stack([b["label"] for b in batch]),
+        "speaker_ids":    [b["speaker_id"] for b in batch],
+    }
+
+
+# ─────────────────────────────────────────────
+# STEP 4: MODEL COMPONENTS
+# ─────────────────────────────────────────────
+class Wav2VecLoRA(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = Wav2Vec2Model.from_pretrained(Config.WAV2VEC_MODEL)
+
+        # Freeze ALL backbone weights
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+        # Inject LoRA only into Q and V attention matrices
+        lora_cfg = LoraConfig(
+            r=Config.LORA_R,
+            lora_alpha=Config.LORA_ALPHA,
+            target_modules=["q_proj", "v_proj"],
+            lora_dropout=0.05,
+            bias="none",
+        )
+        self.backbone = get_peft_model(self.backbone, lora_cfg)
+
+    def forward(self, wav: torch.Tensor, mask: torch.Tensor) -> Tuple:
+        out = self.backbone(
+            input_values=wav,
+            attention_mask=mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        # Returns indices 1-12 (transformer layers only, skips CNN output at index 0)
+        return out.hidden_states[1:]
+
+
+class WeightedLayerAggregation(nn.Module):
+    def __init__(self, num_layers: int = 12):
+        super().__init__()
+        self.weights = nn.Parameter(torch.ones(num_layers))
+
+    def forward(self, hidden_states: Tuple) -> torch.Tensor:
+        w = F.softmax(self.weights, dim=0).view(-1, 1, 1, 1)
+        return (w * torch.stack(hidden_states, dim=0)).sum(dim=0)
+
+
+class AttentionPooling(nn.Module):
+    def __init__(self, hidden_dim: int = 768):
+        super().__init__()
+        self.attn = nn.Linear(hidden_dim, 1)
+
+    def forward(self, h: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        e = torch.tanh(self.attn(h))  # [B, T, 1]
+
+        if mask is not None and mask.shape[1] != h.shape[1]:
+            # Downsample mask from waveform-level to frame-level
+            target = h.shape[1]
+            m = mask.float().unsqueeze(1)
+            k = max(mask.shape[1] // target, 1)
+            pooled = F.avg_pool1d(m, kernel_size=k, stride=k).squeeze(1)
+            # Trim or pad to exact target length
+            if pooled.shape[1] > target:
+                pooled = pooled[:, :target]
+            elif pooled.shape[1] < target:
+                pooled = torch.cat([pooled, torch.zeros(pooled.shape[0], target - pooled.shape[1], device=pooled.device)], dim=1)
+            mask = (pooled > 0.5).long()
+
+        if mask is not None:
+            e = e.masked_fill(mask.unsqueeze(-1) == 0, float("-inf"))
+
+        alpha = torch.nan_to_num(F.softmax(e, dim=1), nan=0.0)  # [B, T, 1]
+        return (alpha * h).sum(dim=1)  # [B, hidden_dim]
+
+
+class AnxietyClassifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Deep branch
+        self.wav2vec  = Wav2VecLoRA()
+        self.agg      = WeightedLayerAggregation(12)
+        self.pool     = AttentionPooling(768)
+        # Acoustic branch
+        self.egemaps  = nn.Sequential(nn.Linear(Config.EGEMAPS_DIM, 128), nn.ReLU(), nn.Dropout(0.2))
+        # Fusion + head
+        self.fusion   = nn.Sequential(nn.Linear(768 + 128, Config.FUSION_DIM), nn.LayerNorm(Config.FUSION_DIM), nn.ReLU(), nn.Dropout(0.3))
+        self.head     = nn.Sequential(nn.Linear(Config.FUSION_DIM, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, 1))
+
+    def forward(self, wav: torch.Tensor, eg: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        deep     = self.pool(self.agg(self.wav2vec(wav, mask)), mask)  # [B, 768]
+        acoustic = self.egemaps(eg)                                    # [B, 128]
+        fused    = self.fusion(torch.cat([deep, acoustic], dim=-1))    # [B, 256]
+        return self.head(fused)                                        # [B, 1]
+
+    def count_trainable(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+# ─────────────────────────────────────────────
+# STEP 5: TRAINING LOOP
+# ─────────────────────────────────────────────
+def run_training(model: AnxietyClassifier, train_loader: DataLoader, val_loader: DataLoader):
+    model.to(Config.DEVICE)
+    print(f"\nTrainable parameters: {model.count_trainable():,}")
+
+    # Separate LR for LoRA adapters vs everything else
+    lora_params  = [p for n, p in model.named_parameters() if "lora"  in n and p.requires_grad]
+    other_params = [p for n, p in model.named_parameters() if "lora" not in n and p.requires_grad]
+
+    if not lora_params:
+        print("WARNING: No LoRA params found. Check target_modules config.")
+
+    opt = AdamW([
+        {"params": lora_params,  "lr": Config.LR_LORA},
+        {"params": other_params, "lr": Config.LR_HEAD},
+    ], weight_decay=0.01)
+
+    total_steps = len(train_loader) * Config.EPOCHS
+    sched = SequentialLR(opt, [
+        LinearLR(opt, start_factor=0.1, end_factor=1.0, total_iters=min(300, total_steps // 5)),
+        CosineAnnealingLR(opt, T_max=max(total_steps - 300, 1))
+    ], milestones=[min(300, total_steps // 5)])
+
+    criterion = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([1.5], device=Config.DEVICE)
+    )
+
+    best_auc, patience_ctr = 0.0, 0
+    history = []
+
+    for epoch in range(Config.EPOCHS):
+        # ── Training ──────────────────────────────────────────────────────
+        model.train()
+        train_loss = 0.0
+        opt.zero_grad()
+
+        for step, batch in enumerate(train_loader):
+            wav  = batch["waveforms"].to(Config.DEVICE)
+            mask = batch["attention_mask"].to(Config.DEVICE)
+            eg   = batch["egemaps"].to(Config.DEVICE)
+            y    = batch["labels"].to(Config.DEVICE).unsqueeze(1)
+
+            logits = model(wav, eg, mask)
+            loss = criterion(logits, y) / Config.GRAD_ACCUM
+            loss.backward()
+            train_loss += loss.item() * Config.GRAD_ACCUM
+
+            if (step + 1) % Config.GRAD_ACCUM == 0 or (step + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], 1.0
+                )
+                opt.step()
+                sched.step()
+                opt.zero_grad()
+
+        avg_train_loss = train_loss / len(train_loader)
+
+        # ── Validation ────────────────────────────────────────────────────
+        model.eval()
+        val_loss, all_probs, all_targs = 0.0, [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                wav  = batch["waveforms"].to(Config.DEVICE)
+                mask = batch["attention_mask"].to(Config.DEVICE)
+                eg   = batch["egemaps"].to(Config.DEVICE)
+                y    = batch["labels"].to(Config.DEVICE).unsqueeze(1)
+
+                logits = model(wav, eg, mask)
+                val_loss += criterion(logits, y).item()
+                all_probs.extend(torch.sigmoid(logits).cpu().numpy().flatten())
+                all_targs.extend(y.cpu().numpy().flatten())
+
+        avg_val_loss = val_loss / max(len(val_loader), 1)
+
+        # Compute AUC (needs both classes present)
+        y_t = np.array(all_targs)
+        y_p = np.array(all_probs)
+        unique_classes = np.unique(y_t)
+        if len(unique_classes) > 1:
+            auc = roc_auc_score(y_t, y_p)
+        else:
+            # Only one class in val — use logit magnitude as proxy
+            auc = float(np.mean(y_p)) if unique_classes[0] == 1 else 1.0 - float(np.mean(y_p))
+            print(f"  Note: Only class {int(unique_classes[0])} in validation. AUC is approximate.")
+
+        print(
+            f"Epoch {epoch+1:02d}/{Config.EPOCHS} | "
+            f"Train Loss: {avg_train_loss:.4f} | "
+            f"Val Loss: {avg_val_loss:.4f} | "
+            f"Val AUC: {auc:.4f}"
+        )
+
+        history.append({"epoch": epoch + 1, "train_loss": avg_train_loss, "val_loss": avg_val_loss, "auc": auc})
+
+        if auc > best_auc:
+            best_auc = auc
+            patience_ctr = 0
+
+            # Save ONLY trainable weights (LoRA + heads): ~2 MB
+            trainable_state = {
+                k: v for k, v in model.state_dict().items()
+                if any(token in k for token in ["lora", "weights", "attn", "egemaps", "fusion", "head"])
+            }
+            ckpt_path = f"{Config.CHECKPOINT_DIR}/best_phase2.pt"
+            config_dict = {k: v for k, v in vars(Config).items() if not k.startswith("__")}
+            torch.save({"model_state_dict": trainable_state, "config": config_dict}, ckpt_path)
+            print(f"  -> New best AUC! Checkpoint saved to {ckpt_path}")
+        else:
+            patience_ctr += 1
+            if patience_ctr >= Config.PATIENCE:
+                print(f"Early stopping triggered at epoch {epoch+1} (no improvement for {Config.PATIENCE} epochs).")
+                break
+
+    # Save training history
+    import json
+    with open(f"{Config.CHECKPOINT_DIR}/training_history.json", "w") as f:
+        json.dump(history, f, indent=2)
+
+    print(f"\nBest Val AUC: {best_auc:.4f}")
+    return best_auc
+
+
+# ─────────────────────────────────────────────
+# STEP 6: MAIN
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  Speech Anxiety Detection — Kaggle Standalone Training")
+    print("=" * 60)
+    print(f"  Device : {Config.DEVICE}")
+    print(f"  Dataset: {Config.DATA_DIR}")
+    print(f"  Checkpoint dir: {Config.CHECKPOINT_DIR}\n")
+
+    # ── 1. Discover participants ────────────────────────────────────────
+    print("--- Step 1: Discovering participants ---")
+    participants = discover_participants(Config.DATA_DIR)
+
+    if not participants:
+        print("\nERROR: No participants found. Stopping.")
+        print("Please check Config.DATA_DIR and make sure files are named '{id}_AUDIO.wav'.")
+        exit(1)
+
+    # Show missing labels warning
+    unlabeled = [p["participant_id"] for p in participants if p["participant_id"] not in Config.LABELS]
+    if unlabeled:
+        print(f"\nWARNING: {len(unlabeled)} participant(s) have no label in Config.LABELS: {unlabeled}")
+        print("  They will default to label=0. Edit Config.LABELS at the top to fix this.")
+
+    # ── 2. Build segments ──────────────────────────────────────────────
+    print("\n--- Step 2: Pre-processing audio into segments ---")
+    all_segments = build_segments(participants, Config.LABELS)
+
+    if not all_segments:
+        print("ERROR: No segments created. Check audio files.")
+        exit(1)
+
+    # ── 3. Split train/val ─────────────────────────────────────────────
+    print("\n--- Step 3: Train/Val split ---")
+    n_total = len(all_segments)
+    n_val   = max(1, int(n_total * Config.VAL_SPLIT))
+    n_train = n_total - n_val
+
+    if n_train < 1:
+        # Edge case: only 1 segment total — use it for both
+        print("WARNING: Very few segments. Using all segments for train AND val.")
+        n_train, n_val = n_total, n_total
+        train_segs = all_segments
+        val_segs   = all_segments
+    else:
+        gen = torch.Generator().manual_seed(Config.SEED)
+        idx = torch.randperm(n_total, generator=gen).tolist()
+        train_segs = [all_segments[i] for i in idx[:n_train]]
+        val_segs   = [all_segments[i] for i in idx[n_train:]]
+
+    print(f"  Train segments: {len(train_segs)}")
+    print(f"  Val segments  : {len(val_segs)}")
+
+    augmentor = AudioAugmentor()
+    train_ds  = SegmentDataset(train_segs, augmentor=augmentor)
+    val_ds    = SegmentDataset(val_segs,   augmentor=None)
+
+    # Clamp batch size to avoid empty batches
+    bs = min(Config.BATCH_SIZE, max(n_train, 1))
+    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,  collate_fn=collate_fn, num_workers=2)
+    val_loader   = DataLoader(val_ds,   batch_size=bs, shuffle=False, collate_fn=collate_fn, num_workers=2)
+
+    # ── 4. Load model ──────────────────────────────────────────────────
+    print("\n--- Step 4: Loading Wav2Vec2 backbone from HuggingFace ---")
+    print("(First run will download ~360 MB. Subsequent runs use cache.)")
+    model = AnxietyClassifier()
+
+    # ── 5. Train ───────────────────────────────────────────────────────
+    print("\n--- Step 5: Training ---")
+    run_training(model, train_loader, val_loader)
+
+    print("\n" + "=" * 60)
+    print(f"  DONE! Download your checkpoint:")
+    print(f"  {Config.CHECKPOINT_DIR}/best_phase2.pt")
+    print("=" * 60)

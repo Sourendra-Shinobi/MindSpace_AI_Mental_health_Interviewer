@@ -1,0 +1,29 @@
+# Data and audio files
+audio_files/
+dataset/
+data/
+*.wav
+*.mp3
+*.flac
+*.md
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch and machine learning
+checkpoints/
+scalers/
+*.pt
+*.pth
+*.joblib
+*.pkl
+
+# Environmental and configuration
+.env
+.venv
+venv/
+env/
+.idea/
+.vscode/
+*.log
