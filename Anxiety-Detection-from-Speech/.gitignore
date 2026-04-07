@@ -1,7 +1,9 @@
 # Data and audio files
+embeddings/
 audio_files/
 dataset/
 data/
+hf_embeddings/
 *.wav
 *.mp3
 *.flac
@@ -13,10 +15,9 @@ __pycache__/
 
 # PyTorch and machine learning
 checkpoints/
-scalers/
+#scalers/
 *.pt
 *.pth
-*.joblib
 *.pkl
 
 # Environmental and configuration

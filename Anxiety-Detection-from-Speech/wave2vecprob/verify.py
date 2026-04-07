@@ -190,5 +190,5 @@ if __name__ == "__main__":
         print("Run with --full flag to include: python verify.py --full\n")
 
     print("=" * 60)
-    print("  ✓ All verification passed!")
+    print(" All verification passed!")
     print("=" * 60)
